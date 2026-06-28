@@ -1,0 +1,32 @@
+# @format
+
+name: Generate protobuf-c
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+jobs:
+  generate-c:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install protobuf-c compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format protobuf-compiler protobuf-c-compiler
+
+      - name: Generate C bindings
+        run: |
+          ./scripts/generate-c.sh
+
+      - name: Upload generated bindings
+        uses: actions/upload-artifact@v6
+        with:
+          name: rr1-messages-generated
+          path: generated/
