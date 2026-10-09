@@ -6,7 +6,14 @@ on:
   push:
     branches:
       - "**"
+    tags:
+      - "v*"
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: generate-c-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   generate-c:
@@ -30,3 +37,93 @@ jobs:
         with:
           name: rr1-messages-generated
           path: generated/
+
+  # Artifacts expire, releases do not. Every publish creates a NEW immutable
+  # release, verifies it, and only then moves GitHub's "latest" pointer to it,
+  # so consumers never see a missing or half-published asset:
+  #   - push to main:  release `bindings-<sha>`, then promoted to "latest"
+  #   - push of v* tag: release `<tag>`, pinned and never promoted
+  release:
+    needs: generate-c
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    # Serialize publishes so an older run cannot promote after a newer one.
+    concurrency:
+      group: generate-c-release
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      ASSET: rr1-messages-generated.zip
+
+    steps:
+      - name: Download generated bindings
+        uses: actions/download-artifact@v8
+        with:
+          name: rr1-messages-generated
+          path: generated
+
+      - name: Package release asset
+        run: |
+          (cd generated && zip -qr "../$ASSET" .)
+          unzip -l "$ASSET"
+
+      - name: Choose release tag
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "TAG=$GITHUB_REF_NAME" >> "$GITHUB_ENV"
+            echo "PROMOTE=false" >> "$GITHUB_ENV"
+          else
+            echo "TAG=bindings-${GITHUB_SHA::12}" >> "$GITHUB_ENV"
+            echo "PROMOTE=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Create release (never replaces an existing one)
+        run: |
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists (re-run); keeping it and verifying."
+          else
+            gh release create "$TAG" "$ASSET" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --notes "protobuf-c bindings generated from ${GITHUB_SHA}." \
+              --latest=false
+          fi
+
+      - name: Verify published asset
+        run: |
+          rm -rf verify && mkdir verify
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "$ASSET" --dir verify
+          unzip -q "verify/$ASSET" -d verify/contents
+          diff -r generated verify/contents
+          echo "Published $TAG matches the generated bindings."
+
+      - name: Promote to latest
+        if: env.PROMOTE == 'true'
+        run: |
+          # Only promote if this commit is still the tip of main.
+          tip="$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)"
+          if [[ "$tip" != "$GITHUB_SHA" ]]; then
+            echo "main has moved on ($tip); not promoting $TAG."
+            exit 0
+          fi
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --latest
+
+      - name: Prune old main releases
+        if: env.PROMOTE == 'true'
+        run: |
+          # Keep the 50 newest bindings-* releases. Pin builds to a v* tag,
+          # not to bindings-<sha>, since these are pruned.
+          gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
+            --json tagName,createdAt \
+            --jq '[.[] | select(.tagName | startswith("bindings-"))]
+                  | sort_by(.createdAt) | reverse | .[50:] | .[].tagName' |
+          while read -r old; do
+            [[ -n "$old" && "$old" != "$TAG" ]] || continue
+            gh release delete "$old" --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes
+          done
